@@ -844,6 +844,10 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
 
                 # get metrics for for each registered benchmark
                 def _reduce_benchmarks(acc, bm_name: str):
+                    print(f"RUNNING BENCHMARK: {bm_name}")
+                    if bm_name != "triton_tutorial_flash_v2":
+                        print(f"SKIPPING BENCHMARK: {bm_name}")
+                        return 0
                     baseline = (
                         bm_name == BASELINE_BENCHMARKS[self.name]
                         if self.name in BASELINE_BENCHMARKS

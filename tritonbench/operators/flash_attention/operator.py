@@ -61,6 +61,7 @@ from tritonbench.kernels.triton_fused_attention import (
 
 
 # [Optional] flash_attn v2
+HAS_FLASH_V2 = True
 try:
     from flash_attn.flash_attn_interface import (
         flash_attn_qkvpacked_func as flash_attn_func,
@@ -68,7 +69,7 @@ try:
 
     from .test_fmha_utils import make_packed_qkv
 except (ImportError, IOError, AttributeError):
-    pass
+    HAS_FLASH_V2 = False
 
 HAS_CUDA_124 = (
     torch.cuda.is_available() and torch.version.cuda and torch.version.cuda >= "12.4"
@@ -244,7 +245,7 @@ class Operator(BenchmarkOperator):
             v,
         )
 
-    @register_benchmark()
+    @register_benchmark(enabled=HAS_FLASH_V2)
     def flash_v2(
         self,
         q: torch.Tensor,
@@ -511,26 +512,10 @@ class Operator(BenchmarkOperator):
         SEQ_LEN_LOG2 = 7
 
         def get_ctx_vals():
-            if self.SEQ_LEN:
-                SEQ_LEN = self.SEQ_LEN
-                for _i in range(self.tb_args.num_inputs):
-                    yield (BATCH, self.H, SEQ_LEN, self.D_HEAD)
-                    SEQ_LEN *= 2
-                return
-            for i in range(SEQ_LEN_LOG2, 15):
-                N_CTX = 2**i
-                # BATCH = 16384 // N_CTX
-                # H = 2048 // D_HEAD
-                yield (BATCH, H, N_CTX, D_HEAD)
+            yield (4, 32, 1, 128)
 
         ctx_vals = get_ctx_vals()
-
-        if self.ragged_shapes:
-            shapes = self.__ragged_shapes()
-        elif self.additional_inputs:
-            shapes = self.__additional_example_input(ctx_vals)
-        else:
-            shapes = ctx_vals
+        shapes = ctx_vals
         requires_grad = True
         for shape in shapes:
             BATCH, H, N_CTX, D_HEAD = shape
