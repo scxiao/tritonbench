@@ -180,10 +180,16 @@ configs = [
         num_stages=s,
         num_warps=w,
     )
-    for BM in [32, 64, 128]  # [32, 64, 128, 256]
-    for BN in [32, 64, 128]  # 32, 64, 128]
-    for s in ([1, 2] if is_hip() else [1, 3])  # 3, 4, 7])
-    for w in [4, 8]  # 4, 8]
+    # for BM in [32, 64, 128]  # [32, 64, 128, 256]
+    # for BN in [32, 64, 128]  # 32, 64, 128]
+    # for s in ([1, 2] if is_hip() else [1, 3])  # 3, 4, 7])
+    # for w in [4, 8]  # 4, 8]
+
+    for BM in [128]  # [32, 64, 128, 256]
+    for BN in [32]  # 32, 64, 128]
+    for s in ([2] if is_hip() else [1, 3])  # 3, 4, 7])
+    for w in [4]  # 4, 8]
+
 ]
 
 
@@ -496,6 +502,19 @@ def _gdpa_fwd(
     IS_DENSE_KV: tl.constexpr,
     activation_enum_int: tl.constexpr,
 ):
+    tl.assume(stride_qm >= 0)
+    tl.assume(stride_qh >= 0)
+    tl.assume(stride_qk >= 0)
+    tl.assume(stride_kn >= 0)
+    tl.assume(stride_kh >= 0)
+    tl.assume(stride_kk >= 0)
+    tl.assume(stride_vn >= 0)
+    tl.assume(stride_vh >= 0)
+    tl.assume(stride_vk >= 0)
+    tl.assume(stride_om >= 0)
+    tl.assume(stride_oh >= 0)
+    tl.assume(stride_ok >= 0)
+
     off_hz = tl.program_id(1)
     if USE_START_END_OFFSETS:
         off_z = (off_hz // H) * 2
@@ -1001,10 +1020,10 @@ bwd_configs = [
         num_stages=s,
         num_warps=w,
     )
-    for BM1 in [32, 64]
-    for BN1 in [32, 64, 128]
-    for s in ([1, 2] if is_hip() else [1, 3])
-    for w in [4, 8]
+    for BM1 in [64]
+    for BN1 in [128]
+    for s in ([2] if is_hip() else [1, 3])
+    for w in [4]
 ]
 
 bwd_configs_ws = [
@@ -1542,6 +1561,14 @@ def _gdpa_bwd(
     IS_DENSE_KV: tl.constexpr,
     activation_enum_int: tl.constexpr,
 ):
+    tl.assume(stride_qm >= 0)
+    tl.assume(stride_km >= 0)
+    tl.assume(stride_qh >= 0)
+    tl.assume(stride_kh >= 0)
+    tl.assume(stride_d >= 0)
+    tl.assume(stride_dom >= 0)
+    tl.assume(stride_doh >= 0)
+
     if USE_START_END_OFFSETS:
         off_z = tl.program_id(2) * 2
     else:
