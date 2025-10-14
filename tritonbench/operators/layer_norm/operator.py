@@ -14,7 +14,7 @@ from tritonbench.utils.triton_op import (
     register_x_val,
 )
 
-from . import tutorial
+from . import fused_triton, tutorial
 
 
 def parse_op_args(args: List[str]):
@@ -41,6 +41,13 @@ except ModuleNotFoundError:
     LigerLayerNormFunction = None
     HAS_LIGER_KERNEL = False
 
+try:
+    from quack.quack_layernorm import layernorm as quack_layernorm
+
+    HAS_QUACK_KERNEL = True
+except ModuleNotFoundError:
+    HAS_QUACK_KERNEL = False
+
 
 class Operator(BenchmarkOperator):
     def __init__(
@@ -50,10 +57,19 @@ class Operator(BenchmarkOperator):
         args = parse_op_args(self.extra_args)
         self.M = args.M
         self.N = args.N
+        if self.tb_args.rtol is None:
+            self.tb_args.rtol = 1e-5
+        if self.tb_args.atol is None:
+            self.tb_args.atol = 5e-3
 
     @register_benchmark()
     def triton_layer_norm(self, *args):
         return lambda: tutorial.layer_norm(*args)
+
+    @register_benchmark()
+    def triton_fused_layer_norm(self, *args):
+        # Fused bwd Triton Layer Norm
+        return lambda: fused_triton.layer_norm(*args)
 
     @register_benchmark(baseline=True)
     def torch_layer_norm(self, *args):
@@ -81,10 +97,10 @@ class Operator(BenchmarkOperator):
         (x, w_shape, weight, bias, eps) = args
         return lambda: LigerLayerNormFunction.apply(x, weight, bias, eps)
 
-    def get_bwd_fn(self, fwd_fn: Callable) -> Callable:
-        y = fwd_fn()
-        dy = 0.1 * torch.randn_like(y)
-        return lambda: y.backward(dy, retain_graph=True)
+    @register_benchmark(enabled=HAS_QUACK_KERNEL)
+    def quack_layer_norm(self, *args) -> Callable:
+        (x, w_shape, weight, bias, eps) = args
+        return lambda: quack_layernorm(x, weight, eps, bias)
 
     def get_grad_to_none(self, args) -> List[torch.Tensor]:
         x = args[0]

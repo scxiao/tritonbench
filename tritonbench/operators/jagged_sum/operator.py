@@ -97,13 +97,14 @@ def execute_kernel_variable_length_loop(x, sum_then_buffer):
 class Operator(BenchmarkOperator):
     DEFAULT_METRICS = ["latency", "best_config"]
     DEFAULT_PRECISION = "fp32"
+    FWD_ONLY = True
 
     def __init__(
         self, tb_args: argparse.Namespace, extra_args: Optional[List[str]] = None
     ):
         super().__init__(tb_args, extra_args)
-        self.sizes = (
-            list(range(2, 12, 4)) + list(range(11, 18, 3))
+        self.sizes = list(
+            range(2, 12, 4)
         )  # bias towards larger sizes, which are more representative of real-world shapes
 
         args = parse_op_args(self.extra_args)
@@ -218,10 +219,9 @@ class Operator(BenchmarkOperator):
                 batch_size, max_seq_len, _ = dense_0.shape
                 yield (nested_tensor, batch_size, 1, max_seq_len, 0.0)
 
-    @register_metric()
-    def accuracy(self, fn: Callable, baseline_fn: Callable) -> bool:
-        output = fn()["output"]
-        baseline_output = baseline_fn()["output"]
+    def _get_accuracy(self, fn: Callable, baseline_fn: Callable) -> bool:
+        output = fn()
+        baseline_output = baseline_fn()
         return torch.allclose(
             output, baseline_output, atol=ABSOLUTE_TOLERANCE, rtol=RELATIVE_TOLERANCE
         )

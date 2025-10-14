@@ -1,8 +1,6 @@
 import argparse
 from typing import Any, Callable, Generator, List, Optional, Tuple
 
-import fbgemm_gpu.experimental.gen_ai  # noqa: F401
-
 import torch
 import triton
 
@@ -44,6 +42,8 @@ if is_cuda():
 HAS_CUTLASS = False
 if is_cuda():
     try:
+        import fbgemm_gpu.experimental.gen_ai
+
         cutlass_fp8_block = torch.ops.llama_cpp.fp8_blockwise_matmul
         HAS_CUTLASS = True
     except:
@@ -123,6 +123,7 @@ def fp8_block_quantize(
 class Operator(BenchmarkOperator):
     DEFAULT_METRICS = ["tflops", "speedup", "accuracy"]
     DEFAULT_PRECISION = "fp8"
+    FWD_ONLY = True
 
     def __init__(
         self, tb_args: argparse.Namespace, extra_args: Optional[List[str]] = None

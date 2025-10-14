@@ -28,10 +28,13 @@ import psutil
 import tabulate
 import torch
 import triton
+from torch.utils._pytree import tree_map
 
 from tritonbench.components.do_bench import do_bench_wrapper, Latency
 from tritonbench.components.export import export_data
 
+from tritonbench.components.power.chart import power_chart_begin, power_chart_end
+from tritonbench.data import SUPPORTED_INPUT_OPS
 from tritonbench.utils.constants import (
     DEFAULT_QUANTILES,
     DEFAULT_REP,
@@ -196,12 +199,13 @@ def _split_params_by_comma(params: Optional[str]) -> List[str]:
 def _find_op_name_from_module_path(module_path: str) -> str:
     PATH_PREFIX = "tritonbench.operators."
     # We have a separate operator loader for aten operator benchmark.
-    PATH_PREFIX_LOADER = "tritonbench.operator_loader.loaders."
+    PATH_PREFIX_LOADER = "tritonbench.operator_loader."
     assert (
         PATH_PREFIX in module_path or PATH_PREFIX_LOADER in module_path
     ), f"We rely on module path prefix to identify operator name. Expected {PATH_PREFIX}<operator_name>, get {module_path}."
     if PATH_PREFIX_LOADER in module_path:
         suffix = module_path.partition(PATH_PREFIX_LOADER)[2]
+        suffix = suffix.partition(".")[2]
     else:
         suffix = module_path.partition(PATH_PREFIX)[2]
     if suffix.startswith("fb."):
@@ -678,11 +682,14 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
     device: str = "cuda"
     # By default, do not touch the input data dtype
     DEFAULT_PRECISION = "bypass"
+    # Whether the operator is forward-only
+    FWD_ONLY: bool = False
     # By default, only collect latency metrics
     # Each operator can override to define their own default metrics
     DEFAULT_METRICS = ["latency"]
     required_metrics: List[str]
     _cur_input_id: Optional[int] = None
+    _cur_backend_name: Optional[str] = None
     _input_iter: Optional[Generator] = None
     extra_args: List[str] = []
     example_inputs: Any = None
@@ -690,6 +697,8 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
     is_compute_bound = True
     # reset dynamo to avoid errors like https://github.com/meta-pytorch/tritonbench/issues/90
     reset_dynamo = True
+    # Hook called after each input benchmark completes
+    benchmark_post_hook: Optional[Callable[[Any], None]] = None
 
     """
     A base class for adding operators to torch benchmark.
@@ -758,15 +767,27 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
             BASELINE_BENCHMARKS[self.name] = self.tb_args.baseline
         self._only = _split_params_by_comma(self.tb_args.only)
         self._skip = _split_params_by_comma(self.tb_args.skip)
+        self._force = self.tb_args.force
         self._only_match_mode = self.tb_args.only_match_mode
-        self._input_id = self.tb_args.input_id
+        # Parse input_id as comma-separated list - always store as a list
+        if "," in self.tb_args.input_id:
+            self._input_ids = [
+                int(id.strip()) for id in self.tb_args.input_id.split(",")
+            ]
+        else:
+            self._input_ids = [int(self.tb_args.input_id)]
         self._num_inputs = self.tb_args.num_inputs
+        self._input_sample_mode = self.tb_args.input_sample_mode
         self.prod_shapes = self.tb_args.prod_shapes
 
     # Run the post initialization
     def __post__init__(self):
         if self.tb_args.input_loader:
-            if is_fbcode() and not hasattr(self, "aten_op_name"):
+            if (
+                is_fbcode()
+                and not hasattr(self, "aten_op_name")
+                and self.name not in SUPPORTED_INPUT_OPS
+            ):
                 from tritonbench.data.fb.input_loader import get_input_loader
 
                 self.get_input_iter = get_input_loader(
@@ -775,14 +796,90 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
             else:
                 from tritonbench.data import get_input_loader
 
-                self._get_input_iter = get_input_loader(
+                self.get_input_iter = get_input_loader(
                     self, self.name, self.tb_args.input_loader
                 )
-        self._available_num_inputs = self.count_example_inputs()
-        if self._num_inputs is None:
-            self._num_inputs = self._available_num_inputs - self._input_id
-        if self._num_inputs > self._available_num_inputs:
-            self._num_inputs = self._available_num_inputs
+        # Count total available inputs directly
+        self._available_num_inputs = sum(1 for _ in self.get_input_iter())
+
+        # Check if multiple IDs are specified explicitly
+        if len(self._input_ids) > 1:
+            # Multiple IDs mode
+            if self._num_inputs is not None:
+                raise ValueError(
+                    f"Cannot use --num-inputs with multiple input IDs. "
+                    f"When specifying multiple IDs (e.g., --input-id 0,2,4), the number of inputs "
+                    f"is determined by the number of IDs provided ({len(self._input_ids)} in this case)."
+                )
+            if self._input_sample_mode == "equally-spaced-k":
+                raise ValueError(
+                    f"Cannot use --input-sample-mode equally-spaced-k with multiple input IDs. "
+                    f"Either specify multiple IDs directly or use equally-spaced-k with --num-inputs."
+                )
+            # Validate that all IDs are within range
+            invalid_ids = [
+                id
+                for id in self._input_ids
+                if id >= self._available_num_inputs or id < 0
+            ]
+            if invalid_ids:
+                raise ValueError(
+                    f"Invalid input IDs {invalid_ids}. Available inputs: 0 to {self._available_num_inputs - 1}"
+                )
+            self._num_inputs = len(self._input_ids)
+        elif self._input_sample_mode == "equally-spaced-k":
+            # Equally-spaced-k mode - generate equally spaced IDs
+            if self._num_inputs is None:
+                raise ValueError(
+                    "--num-inputs must be specified when using --input-sample-mode equally-spaced-k"
+                )
+
+            # When using equally-spaced-k, --input-id must be 0 (the default)
+            if self._input_ids[0] != 0:
+                raise ValueError(
+                    "--input-id must be 0 or omitted when using --input-sample-mode equally-spaced-k"
+                )
+
+            # Generate equally spaced indices
+            if self._num_inputs > self._available_num_inputs:
+                print(
+                    f"Warning: Requested {self._num_inputs} inputs but only {self._available_num_inputs} available. "
+                    f"Using all available inputs.",
+                    file=sys.stderr,
+                )
+                self._num_inputs = self._available_num_inputs
+
+            if self._num_inputs == 1:
+                self._input_ids = [0]
+            else:
+                # Generate equally spaced indices
+                step = (self._available_num_inputs - 1) / (self._num_inputs - 1)
+                self._input_ids = [
+                    int(round(i * step)) for i in range(self._num_inputs)
+                ]
+
+            print(
+                f"Equally-spaced-k mode: Selected {len(self._input_ids)} equally spaced inputs (total available: {self._available_num_inputs})",
+                file=sys.stderr,
+            )
+        else:
+            # First-k mode (default) - construct sequential range based on start ID and num_inputs
+            start_id = self._input_ids[0]
+            if self._num_inputs is None:
+                self._num_inputs = self._available_num_inputs - start_id
+            if self._num_inputs > self._available_num_inputs - start_id:
+                self._num_inputs = self._available_num_inputs - start_id
+            # Expand single ID to sequential range
+            self._input_ids = list(range(start_id, start_id + self._num_inputs))
+
+            logger.warning(
+                f"First-k mode: Selected {len(self._input_ids)} sequential inputs starting from index {start_id} "
+                f"(total available: {self._available_num_inputs})",
+            )
+
+        logger.info(
+            f"Input IDs to run: {self._input_ids}",
+        )
 
     def _get_bm_func(self, bm_func_name: str):
         fwd_fn_lambda = getattr(self, bm_func_name, None)
@@ -817,7 +914,15 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
                 not backend.fwd_only
             ), f"Backend {bm_func_name} does not support backward pass."
             bwd_fn = self.get_bwd_fn(fwd_fn)
-            fwd_bwd_fn = lambda: (fwd_fn(), bwd_fn())
+
+            # FWD_BWD returns (forward_output, grad_tensors_after_backward)
+            def fwd_bwd_fn():
+                fwd_output = fwd_fn()
+                grad_tensors = (
+                    bwd_fn()
+                )  # This runs backward and returns tensors with grads
+                return (fwd_output, grad_tensors)
+
             setattr(fwd_bwd_fn, "_name", bm_func_name)
             return fwd_bwd_fn
         elif self.mode == Mode.FWD_NO_GRAD:
@@ -842,18 +947,40 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
         )
         self.input_iter = input_iter
         self._available_num_inputs = sum(1 for _ in self.get_input_iter())
-        self._num_inputs = self._available_num_inputs - self._input_id
+        self._num_inputs = self._available_num_inputs - len(self._input_ids)
+        self._input_ids = [i for i in range(0, self._num_inputs)]
 
-    def add_benchmark(self, bm_func_name: str, bm_callable: Callable):
-        decorator_kwargs = {
-            "operator_name": self.name,
-            "func_name": bm_func_name,
-            "enabled": True,
-        }
-        decorated_func = register_benchmark(**decorator_kwargs)(bm_callable)
-        bound_method = types.MethodType(decorated_func, self)
+    def add_benchmark(
+        self, bm_func_name: str, bm_callable: Callable, baseline: bool = False
+    ):
+        def _inner(self, *args, **kwargs):
+            # Return a callable that captures the inputs and calls the benchmark function
+            def benchmark_fn():
+                return bm_callable(*args, **kwargs)
+
+            return benchmark_fn
+
+        # Create the backend config object like register_benchmark does
+        backend_config = BenchmarkOperatorBackend(
+            name=bm_func_name,
+            label=bm_func_name,
+            baseline=baseline,
+            enabled=True,
+            fwd_only=False,
+        )
+
+        # Register the backend config in REGISTERED_BENCHMARKS
+        if self.name not in REGISTERED_BENCHMARKS:
+            REGISTERED_BENCHMARKS[self.name] = OrderedDict()
+        REGISTERED_BENCHMARKS[self.name][bm_func_name] = backend_config
+
+        # Set baseline if needed
+        if backend_config.baseline:
+            BASELINE_BENCHMARKS[self.name] = bm_func_name
+
+        # Bind the method to the instance
+        bound_method = types.MethodType(_inner, self)
         setattr(self, bm_func_name or bm_callable.__name__, bound_method)
-        REGISTERED_BENCHMARKS[bm_func_name] = bm_callable
 
     def run(
         self,
@@ -864,6 +991,8 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
     ) -> None:
         """Benchmarking the operator and returning its metrics."""
         metrics = []
+        if self.tb_args.power_chart:
+            power_chart_begin(self.benchmark_name, self.tb_args.power_chart)
         try:
             if "proton" in self.required_metrics:
                 import triton.profiler as proton
@@ -871,15 +1000,21 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
                 self._proton_session_id = proton.start()
                 proton.enter_scope(f"tritonbench_run_op_{self.name}")
                 proton.deactivate(self._proton_session_id)
-            input_id_range = range(self._input_id, self._input_id + self._num_inputs)
+            input_id_range = self._input_ids
             if tqdm is not None:
                 input_id_range = tqdm(input_id_range)
-            if self._input_id:
-                for _dryrun_input_id in range(self._input_id):
-                    self.example_inputs = self.get_example_inputs()
+
+            current_pos = 0
             for input_id in input_id_range:
+                self._cur_backend_name = None
+                # Skip to the correct position if there are gaps
+                while current_pos < input_id:
+                    self.example_inputs = self.get_example_inputs()
+                    current_pos += 1
+
                 self._cur_input_id = input_id
                 self.example_inputs = self.get_example_inputs()
+                current_pos += 1
                 if self.reset_dynamo:
                     torch._dynamo.reset()
                 x_val = self.get_x_val(self.example_inputs)
@@ -902,6 +1037,14 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
                 )
                 # Handle the input data types with best effort
                 apply_precision(self, self.tb_args.precision)
+                # CUDAGraphs run kernels on a fresh stream. Make sure all input
+                # tensors produced on the default stream have finished writing
+                # before we hand them to the captured graph. Otherwise we can
+                # read partially initialized values (e.g. from torch.randint)
+                # and hit device-side asserts in the baseline kernels.
+                if self.use_cuda_graphs:
+                    if torch.accelerator.is_available():
+                        torch.accelerator.synchronize()
                 self.baseline_fn = None
                 self.baseline_metrics = None
                 self._op_flops = {}
@@ -918,9 +1061,20 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
                                     benchmarks.append(bm)
                                     break
                     else:  # exact mode (default)
-                        benchmarks = list(
+                        only_benchmarks = list(
                             dict.fromkeys(self._only)
                         )  # remove duplicates while preserving order
+                        enabled_benchmarks = find_enabled_benchmarks(
+                            self.mode, REGISTERED_BENCHMARKS[self.name], []
+                        )
+                        benchmarks = []
+                        for bm in only_benchmarks:
+                            if bm in enabled_benchmarks or self._force:
+                                benchmarks.append(bm)
+                            else:
+                                logger.warning(
+                                    f"Skipping benchmark {bm} since it is not enabled"
+                                )
                 else:
                     benchmarks = find_enabled_benchmarks(
                         self.mode, REGISTERED_BENCHMARKS[self.name], self._skip
@@ -947,6 +1101,7 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
 
                 # get metrics for for each registered benchmark
                 def _reduce_benchmarks(acc, bm_name: str):
+                    self._cur_backend_name = bm_name
                     baseline = (
                         bm_name == BASELINE_BENCHMARKS[self.name]
                         if self.name in BASELINE_BENCHMARKS
@@ -960,6 +1115,9 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
                         quantiles=quantiles,
                         baseline=baseline,
                     )
+                    # Synchronize after each benchmark to make errors surface sooner
+                    if torch.accelerator.is_available():
+                        torch.accelerator.synchronize()
                     if baseline:
                         self.baseline_metrics = acc[bm_name]
                     if sleep:
@@ -970,6 +1128,7 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
                 y_vals: Dict[str, BenchmarkOperatorMetrics] = functools.reduce(
                     _reduce_benchmarks, benchmarks, {}
                 )
+                self._cur_backend_name = None
                 metrics.append((x_val, y_vals))
                 del self.example_inputs  # save some memory
                 if "proton" in self.required_metrics:
@@ -981,12 +1140,27 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
                 proton.exit_scope()
                 proton.finalize()
         except (KeyboardInterrupt, Exception):
+            backend_suffix = (
+                f" on backend {self._cur_backend_name}"
+                if self._cur_backend_name is not None
+                else ""
+            )
             logger.warning(
-                "Caught exception, terminating early with partial results",
+                "Caught exception%s, terminating early with partial results",
+                backend_suffix,
                 exc_info=True,
             )
+            if getattr(self, "_cur_input_id", None) is not None:
+                logger.warning(
+                    "Failing input: --input-id %s --num-inputs 1 --input-sample-mode first-k",
+                    self._cur_input_id,
+                )
+            if self.tb_args.exit_on_exception:
+                os._exit(1)
             raise
         finally:
+            if self.tb_args.power_chart:
+                power_chart_end()
             self.output = BenchmarkOperatorResult(
                 benchmark_name=self.tb_args.benchmark_name,
                 op_name=self.name,
@@ -1000,9 +1174,40 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
         return self._cur_input_id
 
     def get_bwd_fn(self, fwd_fn: Callable) -> Callable:
-        raise NotImplementedError(
-            "Each operator must implement its own backward function."
-        )
+        # Extract tensors that require gradients from example_inputs
+        grad_tensors = []
+
+        def extract_if_requires_grad(x):
+            if isinstance(x, torch.Tensor) and x.requires_grad:
+                grad_tensors.append(x)
+            return x
+
+        # Use tree_map to find all grad tensors in example_inputs
+        # example_inputs is set by the benchmark framework and contains the current input
+        tree_map(extract_if_requires_grad, self.example_inputs)
+
+        state = {"y": None, "dy": None}
+
+        def bwd_fn():
+            # Clear existing gradients
+            for t in grad_tensors:
+                if t.grad is not None:
+                    t.grad = None
+
+            # Initialize on first call
+            if state["y"] is None:
+                output = fwd_fn()
+                state["y"] = output[0] if isinstance(output, tuple) else output
+                torch.manual_seed(0)
+                state["dy"] = 0.1 * torch.randn_like(state["y"])
+
+            # Run backward
+            state["y"].backward(state["dy"], retain_graph=True)
+
+            # Return the tensors (not gradients) for accuracy checking
+            return grad_tensors
+
+        return bwd_fn
 
     def get_input_iter(self) -> Generator:
         """Return the dynamic input iterator for the model."""
@@ -1150,12 +1355,6 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
             tensor_cond, tensor_action, self.example_inputs
         )
 
-    def count_example_inputs(self):
-        total_possible = sum(1 for _ in self.get_input_iter())
-        if self._num_inputs is not None and self._num_inputs <= total_possible:
-            return self._num_inputs
-        return total_possible
-
     def get_example_inputs(self):
         if self._input_iter is None:
             self._input_iter = self.get_input_iter()
@@ -1173,7 +1372,7 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
         parts = [x for x in ["tritonbench", unix_user, logging_group] if x]
         tritonbench_dir_name = "_".join(parts)
         benchmark_name = self.benchmark_name
-        fn_part = f"{fn_name}_{self._input_id}" if fn_name else ""
+        fn_part = f"{fn_name}_{self._cur_input_id}" if fn_name else ""
         out_part = Path(tempfile.gettempdir()) / tritonbench_dir_name / benchmark_name
         return out_part / fn_part if fn_part else out_part
 
@@ -1194,11 +1393,105 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
     def logging_group(self) -> Optional[str]:
         return self.tb_args.logging_group
 
+    def _clone_gradients(self, tensors, mode="") -> List[Optional[torch.Tensor]]:
+        """Clone gradients from the provided tensors.
+
+        Args:
+            tensors: List/tuple of tensors (each should have `.grad` possibly populated)
+            mode: Optional mode information for better error messages
+
+        Returns:
+            List of cloned gradients (or None when no gradient was produced).
+        """
+
+        assert isinstance(tensors, (list, tuple)), (
+            f"{mode}: Backward function must return a list/tuple of tensors"
+            if mode
+            else "Backward function must return a list/tuple of tensors"
+        )
+
+        grads: List[Optional[torch.Tensor]] = []
+        for idx, tensor in enumerate(tensors):
+            if tensor is None:
+                grads.append(None)
+                continue
+
+            if not isinstance(tensor, torch.Tensor):
+                raise TypeError(
+                    f"{mode}: Expected tensor in backward results at index {idx}, "
+                    f"got {type(tensor)}"
+                    if mode
+                    else (
+                        "Expected tensor in backward results but received "
+                        f"{type(tensor)}"
+                    )
+                )
+
+            grad = tensor.grad
+            grads.append(grad.detach().clone() if grad is not None else None)
+
+        return grads
+
+    def _check_gradients(self, grads, baseline_grads, mode=""):
+        """Helper to check gradients between two sets of tensors.
+
+        Args:
+            grads: List of gradient tensors (or None) from implementation
+            baseline_grads: List of gradient tensors (or None) from baseline
+            mode: Mode name for error messages (e.g. "BWD" or "FWD_BWD")
+
+        Returns:
+            True if gradients match, False otherwise
+        """
+        prefix = f"{mode}: " if mode else ""
+
+        # Ensure we have tensors to check
+        assert len(grads) > 0, (
+            f"{prefix}No tensors with requires_grad=True found. "
+            "Check that input tensors have requires_grad set."
+        )
+
+        # Ensure same number of grad tensors
+        assert len(grads) == len(baseline_grads), (
+            f"{prefix}Mismatch in number of grad tensors: {len(grads)} vs "
+            f"{len(baseline_grads)}"
+        )
+
+        # Compare each tensor's gradient
+        has_gradient = False
+        for i, (grad, baseline_grad) in enumerate(zip(grads, baseline_grads)):
+            # Check gradient existence
+            if (grad is None) != (baseline_grad is None):
+                print(
+                    f"{prefix}Gradient existence mismatch for tensor {i}: "
+                    f"impl has grad={grad is not None}, "
+                    f"baseline has grad={baseline_grad is not None}"
+                )
+                return False
+
+            if grad is not None:
+                has_gradient = True
+                torch.testing.assert_close(
+                    grad,
+                    baseline_grad,
+                    rtol=self.tb_args.rtol,
+                    atol=self.tb_args.atol,
+                    msg=f"{prefix}Gradient mismatch for tensor {i} with shape {grad.shape}",
+                )
+
+        # Ensure at least one tensor has a gradient
+        assert has_gradient, (
+            f"{prefix}No gradients were computed. All tensors have grad=None. "
+            "Check that backward was called and tensors require gradients."
+        )
+
+        return True
+
     def accuracy(self, fn: Callable, baseline_fn: Callable) -> bool:
-        output = fn()
-        baseline_output = baseline_fn()
         try:
             if self.mode == Mode.FWD:
+                output = fn()
+                baseline_output = baseline_fn()
                 torch.testing.assert_close(
                     output,
                     baseline_output,
@@ -1206,30 +1499,63 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
                     atol=self.tb_args.atol,
                 )
             elif self.mode == Mode.BWD:
-                torch.testing.assert_close(
-                    output.grad,
-                    baseline_output.grad,
-                    rtol=self.tb_args.rtol,
-                    atol=self.tb_args.atol,
+                # Get tensors with gradients from both implementations
+                grad_tensors = fn()
+                # Clone gradients to maintain an isolated copy of the result for later comparison
+                impl_grads = self._clone_gradients(grad_tensors, mode="BWD")
+
+                baseline_grad_tensors = baseline_fn()
+                baseline_grads = self._clone_gradients(
+                    baseline_grad_tensors, mode="BWD"
                 )
-            else:
-                fwd_output, loss = output
-                baseline_fwd_output, baseline_loss = baseline_output
+                # Use helper to check gradients
+                if not self._check_gradients(impl_grads, baseline_grads, "BWD"):
+                    return False
+            elif self.mode == Mode.FWD_BWD:
+                # FWD_BWD should return (forward_output, grad_tensors) tuple
+                output = fn()
+
+                # Unpack the results - expecting (fwd_output, grad_tensors)
+                if isinstance(output, tuple) and len(output) == 2:
+                    fwd_output, grad_tensors = output
+                    # Clone gradients to maintain an isolated copy of the result for later comparison
+                    impl_grads = self._clone_gradients(grad_tensors, mode="FWD_BWD")
+
+                    baseline_output = baseline_fn()
+                    baseline_fwd_output, baseline_grad_tensors = baseline_output
+                    baseline_grads = self._clone_gradients(
+                        baseline_grad_tensors, mode="FWD_BWD"
+                    )
+
+                    # Check forward outputs match
+                    torch.testing.assert_close(
+                        fwd_output,
+                        baseline_fwd_output,
+                        rtol=self.tb_args.rtol,
+                        atol=self.tb_args.atol,
+                    )
+
+                    # Check backward gradients using helper
+                    if not self._check_gradients(impl_grads, baseline_grads, "FWD_BWD"):
+                        return False
+                else:
+                    # FWD_BWD mode requires specific return format
+                    raise AssertionError(
+                        f"FWD_BWD mode expects functions to return (forward_output, grad_tensors) tuple, "
+                        f"but got {type(output)}. Operators must properly implement get_bwd_fn() for FWD_BWD mode."
+                    )
+            else:  # FWD_NO_GRAD
+                output = fn()
+                baseline_output = baseline_fn()
                 torch.testing.assert_close(
-                    fwd_output,
-                    baseline_fwd_output,
-                    rtol=self.tb_args.rtol,
-                    atol=self.tb_args.atol,
-                )
-                torch.testing.assert_close(
-                    loss.grad,
-                    baseline_loss.grad,
+                    output,
+                    baseline_output,
                     rtol=self.tb_args.rtol,
                     atol=self.tb_args.atol,
                 )
             return True
-        except Exception:
-            # either the output tensor or the loss grad tensor does not match
+        except Exception as e:
+            logger.warning(f"Exception during accuracy check: {e}")
             return False
 
     def _do_bench(
@@ -1428,10 +1754,10 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
                 assert (
                     self.required_metrics == ["_compile_time_kineto_trace_in_task"]
                     and len(self._only) == 1
-                    and (self._input_id is not None)
+                    and (self._cur_input_id is not None)
                 ), (
                     "_compile_time_kineto_trace_in_task must be measured by itself. "
-                    f"required_metrics: {self.required_metrics}, _only: {self._only}, _input_id: {self._input_id}"
+                    f"required_metrics: {self.required_metrics}, _only: {self._only}, _input_id: {self._cur_input_id}"
                 )
                 from tritonbench.components.compile_time import (
                     do_compile_kineto_trace_in_task,
@@ -1453,10 +1779,10 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
                 assert (
                     self.required_metrics == ["_compile_time_in_task"]
                     and len(self._only) == 1
-                    and (self._input_id is not None)
+                    and (self._cur_input_id is not None)
                 ), (
                     "_compile_time_in_task must be measured by itself. "
-                    f"required_metrics: {self.required_metrics}, _only: {self._only}, _input_id: {self._input_id}"
+                    f"required_metrics: {self.required_metrics}, _only: {self._only}, _input_id: {self._cur_input_id}"
                 )
                 from tritonbench.components.compile_time import do_compile_time_in_task
 
@@ -1485,14 +1811,14 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
                     self._latency_with_compile_in_task = metrics.extra_metrics[
                         "_compile_time_in_task"
                     ]
-            if "_ncu_trace_in_task" in self.required_metrics:
+            if "single_run_in_task" in self.required_metrics:
                 assert (
-                    self.required_metrics == ["_ncu_trace_in_task"]
+                    self.required_metrics == ["single_run_in_task"]
                     and len(self._only) == 1
-                    and (self._input_id is not None)
+                    and (self._cur_input_id is not None)
                 ), (
-                    "_ncu_trace_in_task must be measured by itself. "
-                    f"required_metrics: {self.required_metrics}, _only: {self._only}, _input_id: {self._input_id}"
+                    "single_run_in_task must be measured by itself. "
+                    f"required_metrics: {self.required_metrics}, _only: {self._only}, _input_id: {self._cur_input_id}"
                 )
                 from tritonbench.components.ncu import do_bench_in_task
 
@@ -1501,26 +1827,7 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
                     grad_to_none=self.get_grad_to_none(self.example_inputs),
                     range_name=_RANGE_NAME,
                 )
-                metrics.extra_metrics["_ncu_trace_in_task"] = "success"
-            if "_nsys_rep_in_task" in self.required_metrics:
-                assert (
-                    self.required_metrics == ["_nsys_rep_in_task"]
-                    and len(self._only) == 1
-                    and (self._input_id is not None)
-                ), (
-                    "_nsys_rep_in_task must be measured by itself. "
-                    f"required_metrics: {self.required_metrics}, _only: {self._only}, _input_id: {self._input_id}"
-                )
-                from tritonbench.components.ncu import do_bench_in_task
-
-                do_bench_in_task(
-                    fn=fn,
-                    grad_to_none=self.get_grad_to_none(self.example_inputs),
-                    range_name=_RANGE_NAME,
-                    warmup=True,
-                    use_cuda_profiler_range=True,
-                )
-                metrics.extra_metrics["_nsys_rep_in_task"] = "success"
+                metrics.extra_metrics["single_run_in_task"] = "success"
             if self.tb_args.export:
                 export_data(
                     x_val=self.get_x_val(self.example_inputs),
@@ -1551,6 +1858,10 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
             if not self.tb_args.keep_going:
                 raise
             metrics.error_msg = str(e)
+
+        if self.benchmark_post_hook:
+            self.benchmark_post_hook(fn_name, metrics)
+
         return metrics
 
     def do_bench_cudagraph_mem(
@@ -1669,16 +1980,15 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
         return op_task_args
 
     def nsys_rep(self, input_id: int, fn_name: str) -> str:
-        op_task_args = self._get_op_task_args(input_id, fn_name, "_nsys_rep_in_task")
+        op_task_args = self._get_op_task_args(input_id, fn_name, "single_run_in_task")
         nsys_output_dir = self.get_temp_path(fn_name)
         nsys_output_dir.mkdir(parents=True, exist_ok=True)
         ext = ".nsys-rep"
+        nsys_bin = os.environ.get("NSYS_BIN", "nsys")
         nsys_output_file = nsys_output_dir.joinpath(f"nsys_rep{ext}").resolve()
         nsys_trace_cmd = [
-            "nsys",
+            nsys_bin,
             "profile",
-            "-c",
-            "cudaProfilerApi",
             "-t",
             "nvtx,osrt,cuda,cudnn,cublas",
             "-w",
@@ -1686,7 +1996,7 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
             "-f",
             "true",
             "-o",
-            nsys_output_file,
+            str(nsys_output_file),
         ]
         nsys_trace_cmd.extend(op_task_args)
         try:
@@ -1712,7 +2022,7 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
                 "full",
             ]
         )
-        op_task_args = self._get_op_task_args(input_id, fn_name, "_ncu_trace_in_task")
+        op_task_args = self._get_op_task_args(input_id, fn_name, "single_run_in_task")
         # Disable DCGM
         disable_dyno_dcgm = [
             "sudo",
@@ -1793,7 +2103,7 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
         return str(ncu_output_file.resolve())
 
     def att_trace(self, input_id: int, fn_name: str) -> str:
-        op_task_args = self._get_op_task_args(input_id, fn_name, "_ncu_trace_in_task")
+        op_task_args = self._get_op_task_args(input_id, fn_name, "single_run_in_task")
         att_output_dir = self.get_temp_path(fn_name)
         att_trace_dir = launch_att(att_output_dir, op_task_args)
         return att_trace_dir
@@ -1968,14 +2278,14 @@ class BenchmarkOperator(metaclass=PostInitProcessor):
                     f.write(sass)
 
     @classmethod
-    def has_bwd(cls) -> bool:
-        return cls.get_bwd_fn is not BenchmarkOperator.get_bwd_fn
-
-    @classmethod
     def has_metric(cls, metric_name: str) -> bool:
         if metric_name == "tflops":
             return bool(getattr(cls, "flops", None))
         return bool(getattr(cls, metric_name, None))
+
+    @classmethod
+    def has_bwd(cls) -> bool:
+        return not cls.FWD_ONLY
 
     @classmethod
     def has_baseline(cls) -> Optional[str]:

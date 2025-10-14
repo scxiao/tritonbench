@@ -12,7 +12,7 @@ from tritonbench.utils.triton_op import (
 )
 
 try:
-    from liger_kernel.transformers.cross_entropy import LigerCrossEntropyLoss
+    from .liger_cross_entropy import LigerCrossEntropyLoss
 except ModuleNotFoundError:
     LigerCrossEntropyLoss = None
 
@@ -78,11 +78,6 @@ class Operator(BenchmarkOperator):
     def get_x_val(self, example_inputs) -> Tuple[int, int, int]:
         v = example_inputs[0].size(-1)
         return (self.B, self.T, v)
-
-    def get_bwd_fn(self, fwd_fn: Callable) -> Callable:
-        y = fwd_fn()
-        # TODO: how to pass grad_to_none=[_input]?
-        return lambda: y.backward(retain_graph=True)
 
     def get_grad_to_none(self, args) -> List[torch.Tensor]:
         x = args[0]

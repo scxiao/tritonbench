@@ -21,7 +21,7 @@ def do_bench_in_task(
     grad_to_none=None,
     range_name: str = "",
     warmup: bool = False,
-    warmup_time: int = 25,
+    test_run: bool = False,
     use_cuda_profiler_range: bool = False,
 ) -> None:
     """
@@ -34,7 +34,8 @@ def do_bench_in_task(
     :type grad_to_none: torch.tensor, optional
     """
 
-    fn()
+    if test_run:
+        fn()
     torch.cuda.synchronize()
 
     cache = torch.empty(int(256e6 // 4), dtype=torch.int, device="cuda")

@@ -166,6 +166,82 @@ def _do_bench_inductor(fn, warmup, rep, return_mode="all", grad_to_none=None):
     return _summarize_statistics(times, quantiles=None, return_mode=return_mode)
 
 
+def _do_bench_cudagraph_with_cache_clear(
+    fn, rep=20, grad_to_none=None, quantiles=None, return_mode="mean"
+):
+    """Clone of triton.testing.do_bench_cudagraph with explicit L2 cache clearing."""
+    assert return_mode in ["min", "max", "mean", "median", "all"]
+
+    cache = triton.runtime.driver.active.get_empty_cache_for_benchmark()
+
+    with torch.cuda.stream(torch.cuda.Stream()):
+        cache.zero_()
+        fn()
+        if grad_to_none is not None:
+            for x in grad_to_none:
+                x.detach_()
+                x.requires_grad_(True)
+                x.grad = None
+
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
+        for _ in range(5):
+            cache.zero_()
+            fn()
+        end_event.record()
+        torch.cuda.synchronize()
+        estimate_ms = start_event.elapsed_time(end_event) / 5
+
+        n_repeat = 1000 if estimate_ms == 0 else max(1, int(rep / estimate_ms))
+
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            for _ in range(n_repeat):
+                if grad_to_none is not None:
+                    for x in grad_to_none:
+                        x.grad = None
+                cache.zero_()
+                fn()
+        torch.cuda.synchronize()
+
+        cache_clear_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(cache_clear_graph):
+            for _ in range(n_repeat):
+                cache.zero_()
+        torch.cuda.synchronize()
+
+        n_retries = 10
+        cache_clear_times = []
+        total_times = []
+        for _ in range(n_retries):
+            cache_clear_start_event = torch.cuda.Event(enable_timing=True)
+            cache_clear_end_event = torch.cuda.Event(enable_timing=True)
+            cache_clear_start_event.record()
+            cache_clear_graph.replay()
+            cache_clear_end_event.record()
+            torch.cuda.synchronize()
+            cache_clear_times.append(
+                cache_clear_start_event.elapsed_time(cache_clear_end_event) / n_repeat
+            )
+
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
+            g.replay()
+            end_event.record()
+            torch.cuda.synchronize()
+            total_times.append(start_event.elapsed_time(end_event) / n_repeat)
+
+    all_kernel_times = []
+    for total_time, cache_clear_time in zip(total_times, cache_clear_times):
+        kernel_time = total_time - cache_clear_time
+        all_kernel_times.append(kernel_time)
+
+    times = torch.tensor(all_kernel_times, dtype=torch.float)
+    return _summarize_statistics(times, quantiles, return_mode)
+
+
 def _do_bench_profiler(
     fn, warmup, rep, return_mode="all", grad_to_none=None, use_cudagraph=False
 ):
@@ -189,7 +265,13 @@ def _do_bench_profiler(
     cache = triton.runtime.driver.active.get_empty_cache_for_benchmark()
 
     # First, estimate the runtime to calculate iterations
-    estimate_ms = benchmarker.benchmark_gpu(fn, estimation_iters=5, benchmark_iters=10)
+    estimate_ms = triton.testing.do_bench(
+        fn,
+        warmup=warmup,
+        rep=rep,
+        grad_to_none=grad_to_none,
+        return_mode="mean",
+    )
 
     # Calculate number of iterations based on target rep time
     if estimate_ms == 0:
@@ -236,17 +318,7 @@ def _do_bench_profiler(
         "with_stack": False,
     }
 
-    for _ in range(n_profiler_runs):
-        # Profile execution
-        with torch.profiler.profile(**profiler_config) as prof:
-            if use_cudagraph:
-                g.replay()
-            else:
-                # Execute multiple iterations for regular mode
-                for _ in range(iterations_per_profiler_run):
-                    run_iteration()
-            torch.cuda.synchronize()
-
+    def _trace_handler(prof: torch.profiler.profile) -> None:
         # Collect all kernel execution intervals
         kernel_intervals = []
 
@@ -299,10 +371,23 @@ def _do_bench_profiler(
             )
 
         # Convert to milliseconds and normalize by iterations
-        total_kernel_time_ms = (
+        kernel_time_per_iteration_ms = (
             total_kernel_time_us / 1000.0
         ) / iterations_per_profiler_run
-        all_kernel_times.append(total_kernel_time_ms)
+        all_kernel_times.append(kernel_time_per_iteration_ms)
+
+    for _ in range(n_profiler_runs):
+        # Profile execution
+        with torch.profiler.profile(
+            **profiler_config, on_trace_ready=_trace_handler
+        ) as prof:
+            if use_cudagraph:
+                g.replay()
+            else:
+                # Execute multiple iterations for regular mode
+                for _ in range(iterations_per_profiler_run):
+                    run_iteration()
+            torch.cuda.synchronize()
 
     times = torch.tensor(all_kernel_times, dtype=torch.float)
     return _summarize_statistics(times, quantiles=None, return_mode=return_mode)
@@ -380,7 +465,7 @@ def do_bench_wrapper(
                 if latency_measure_mode == "profiler":
                     bench_fn = partial(_do_bench_profiler, warmup=1, use_cudagraph=True)
                 else:
-                    bench_fn = triton.testing.do_bench_cudagraph
+                    bench_fn = _do_bench_cudagraph_with_cache_clear
 
                 return Latency(
                     times=bench_fn(

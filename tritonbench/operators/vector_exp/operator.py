@@ -10,7 +10,7 @@ from tritonbench.utils.triton_op import (
     register_metric,
 )
 
-from .kernels import triton_exp_kernel
+from .kernels import TritonExpFunction
 
 
 class Operator(BenchmarkOperator):
@@ -46,27 +46,14 @@ class Operator(BenchmarkOperator):
 
     @register_benchmark()
     def triton_exp(self, x: torch.Tensor):
-        # We need to preallocate the output.
-        output = torch.empty_like(x)
-        n_elements = output.numel()
-        # The SPMD launch grid denotes the number of kernel instances that run in parallel.
-        # It is analogous to CUDA launch grids. It can be either Tuple[int], or Callable(metaparameters) -> Tuple[int].
-        # In this case, we use a 1D grid where the size is the number of blocks:
-        grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
-        # NOTE:
-        #  - Each torch.tensor object is implicitly converted into a pointer to its first element.
-        #  - `triton.jit`'ed functions can be indexed with a launch grid to obtain a callable GPU kernel.
-        #  - Don't forget to pass meta-parameters as keywords arguments.
-
+        n_elements = x.numel()
         # Prepare a memory buffer to store the profiled data, with the size equal to the number of programs.
         BLOCK_SIZE = 1024
         n_programs = triton.cdiv(n_elements, BLOCK_SIZE)
         profile_mem = torch.empty(n_programs, dtype=torch.int64, device=self.device)
 
         def _inner():
-            triton_exp_kernel[grid](
-                x, output, n_elements, BLOCK_SIZE=1024, profile_mem=profile_mem
-            )
+            output = TritonExpFunction.apply(x, BLOCK_SIZE, profile_mem)
             return {"output": output, "profile_mem": profile_mem}
 
         return _inner
@@ -133,5 +120,23 @@ class Operator(BenchmarkOperator):
 
     def get_input_iter(self) -> Generator:
         for size in self.get_x_vals():
-            x = torch.rand(size, device=self.device, dtype=self.dtype)
+            x = torch.rand(
+                size, device=self.device, dtype=self.dtype, requires_grad=True
+            )
             yield (x,)
+
+    def get_bwd_fn(self, fwd_fn: Callable) -> Callable:
+        def _bwd():
+            x = self.example_inputs[0]
+            # clear existing grad
+            x.grad = None
+            y = fwd_fn()["output"]
+            dy = torch.randn_like(y)
+            y.backward(dy, retain_graph=True)
+            return {"output": x.grad}
+
+        return _bwd
+
+    def get_grad_to_none(self, args) -> List[torch.Tensor]:
+        x = args[0]
+        return [x]

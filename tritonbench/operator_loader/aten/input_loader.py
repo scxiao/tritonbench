@@ -7,7 +7,6 @@ import json
 import logging
 import math
 from collections import Counter, defaultdict
-from pathlib import Path
 from typing import Any, Callable, Generator
 
 import torch
@@ -39,7 +38,7 @@ dtype_abbrs = {
 
 dtype_abbrs_parsing = {value: key for key, value in dtype_abbrs.items()}
 
-INPUT_CONFIG_DIR = Path(__file__).parent.parent.joinpath("input_configs")
+from tritonbench.data import INPUT_CONFIG_DIR
 
 
 def truncate_inp(arg):
@@ -164,7 +163,7 @@ def deserialize_args(inps):
     return eval(inps.strip().strip("'").strip('"'), global_vals)
 
 
-class OperatorInputsLoader:
+class OperatorInputLoader:
     def __init__(self, op_name: str, json_file_path: str):
         self.op_name = op_name
         self.operator_db = defaultdict(Counter)
@@ -229,5 +228,5 @@ class OperatorInputsLoader:
 def get_input_iter(tritonbench_op: Any, op: str, input: str) -> Generator:
     aten_op_name = tritonbench_op.aten_op_name
     input_file_path = INPUT_CONFIG_DIR.joinpath(input)
-    operator_inputs_loader = OperatorInputsLoader(aten_op_name, input_file_path)
+    operator_inputs_loader = OperatorInputLoader(aten_op_name, input_file_path)
     return operator_inputs_loader.get_input_iter()

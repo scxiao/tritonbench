@@ -5,7 +5,10 @@ https://github.com/pytorch/test-infra/blob/main/clickhouse_db_schema/oss_ci_benc
 
 import argparse
 import json
+import os
 import re
+import sys
+from os.path import abspath, exists
 from pathlib import Path
 
 from typing import Any, Dict, List, Tuple
@@ -15,8 +18,35 @@ RUNNER_TYPE_MAPPING = {
         "name": "gcp-h100-runner",
         "gpu_count": 1,
         "avail_gpu_mem_in_gb": 80,
-    }
+    },
+    "amd-mi350-runner": {
+        "name": "amd-mi350-runner",
+        "gpu_count": 1,
+        "avail_gpu_mem_in_gb": 288,
+    },
 }
+
+
+def setup_tritonbench_cwd():
+    original_dir = abspath(os.getcwd())
+
+    for tritonbench_dir in (
+        ".",
+        "../../tritonbench",
+    ):
+        if exists(tritonbench_dir):
+            break
+
+    if exists(tritonbench_dir):
+        tritonbench_dir = abspath(tritonbench_dir)
+        os.chdir(tritonbench_dir)
+        sys.path.append(tritonbench_dir)
+    return original_dir
+
+
+setup_tritonbench_cwd()
+
+from tritonbench.utils.scuba_utils import get_github_env
 
 
 def parse_runners(
@@ -130,6 +160,11 @@ if __name__ == "__main__":
         required=True,
         help="Upload benchmark result json file.",
     )
+    parser.add_argument(
+        "--add-github-env",
+        action="store_true",
+        help="Add github env to the result json file.",
+    )
     parser.add_argument("--output", required=True, help="output json.")
     args = parser.parse_args()
     upload_file_path = Path(args.json)
@@ -138,8 +173,13 @@ if __name__ == "__main__":
     ), f"Specified result json path {args.json} does not exist."
     with open(upload_file_path, "r") as fp:
         benchmark_result = json.load(fp)
-    oss_ci_v3_json = generate_oss_ci_benchmark_v3_json(benchmark_result)
-    out_str = v3_json_to_str(oss_ci_v3_json)
+    if args.add_github_env:
+        github_env = get_github_env()
+        benchmark_result["github"] = github_env
+        out_str = v3_json_to_str(benchmark_result, to_lines=False)
+    else:
+        oss_ci_v3_json = generate_oss_ci_benchmark_v3_json(benchmark_result)
+        out_str = v3_json_to_str(oss_ci_v3_json)
     output_dir = Path(args.output).parent
     output_dir.mkdir(parents=True, exist_ok=True)
     with open(args.output, "w") as fp:

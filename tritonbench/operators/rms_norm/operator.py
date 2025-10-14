@@ -4,12 +4,16 @@ from typing import Callable, Generator, List, Optional, Tuple
 import torch
 
 from tritonbench.utils.env_utils import is_hip
+from tritonbench.utils.python_utils import try_import
 
 from tritonbench.utils.triton_op import (
     BenchmarkOperator,
+    Mode,
     register_benchmark,
     register_x_val,
 )
+
+from . import fused_triton
 
 try:
     from liger_kernel.transformers.rms_norm import LigerRMSNorm
@@ -27,6 +31,9 @@ try:
     from .quack import QuackRMSNorm
 except ModuleNotFoundError:
     QuackRMSNorm = None
+
+with try_import("HAS_TILELANG"):
+    from .tilelang import TileLangRMSNorm
 
 
 def parse_op_args(args: List[str]):
@@ -78,6 +85,10 @@ class Operator(BenchmarkOperator):
         # they are generated later
         self.llama_rms_op = None
         self.liger_rms_op = None
+        if self.tb_args.rtol is None:
+            self.tb_args.rtol = 1e-5
+        if self.tb_args.atol is None:
+            self.tb_args.atol = 1e-4
 
     def get_input_iter(self) -> Generator:
         # If H is provided, use only that value; otherwise use the default range
@@ -86,46 +97,73 @@ class Operator(BenchmarkOperator):
         else:
             H_values = [2**i for i in range(10, 16)]
 
+        requires_grad = self.mode in (Mode.BWD, Mode.FWD_BWD)
+
         for H in H_values:
             x_shape = (self.M, H)
-            _input = torch.randn(x_shape, dtype=self.dtype, device=self.device)
-            yield H, _input
+            _input = torch.randn(
+                x_shape,
+                dtype=self.dtype,
+                device=self.device,
+                requires_grad=requires_grad,
+            )
+            weight = torch.nn.Parameter(
+                torch.ones(H, dtype=self.dtype, device=self.device),
+                requires_grad=requires_grad,
+            )
+            yield H, _input, weight
 
     @register_benchmark(baseline=True)
-    def llama_rms(self, H, input) -> Callable:
-        self.llama_rms_op = LlamaRMSNorm(hidden_size=H, eps=self.eps).to(self.device)
-        return lambda: self.llama_rms_op(input)
+    def llama_rms(self, H, input, weight) -> Callable:
+        module = LlamaRMSNorm(hidden_size=H, eps=self.eps).to(self.device)
+        module.weight = weight
+        self.llama_rms_op = module
+        return lambda: module(input)
 
-    @register_benchmark()
-    def liger_rms(self, H, input) -> Callable:
-        self.liger_rms_op = LigerRMSNorm(hidden_size=H, eps=self.eps).to(self.device)
-        return lambda: self.liger_rms_op(input)
+    @register_benchmark(enabled=LigerRMSNorm is not None)
+    def liger_rms(self, H, input, weight) -> Callable:
+        module = LigerRMSNorm(
+            hidden_size=H,
+            eps=self.eps,
+            in_place=False,
+        ).to(self.device)
+        module.weight = weight
+        self.liger_rms_op = module
+        return lambda: module(input)
 
     @register_benchmark(enabled=QuackRMSNorm)
-    def quack_rms(self, H, input) -> Callable:
-        self.quack_rms_op = QuackRMSNorm(hidden_size=H, eps=self.eps).to(self.device)
-        return lambda: self.quack_rms_op(input)
+    def quack_rms(self, H, input, weight) -> Callable:
+        module = QuackRMSNorm(hidden_size=H, eps=self.eps).to(self.device)
+        module.weight = weight
+        self.quack_rms_op = module
+        return lambda: module(input)
 
     @register_benchmark()
-    def torch_compile_rms(self, H, input) -> Callable:
-        if self.llama_rms_op is None:
-            self.llama_rms_op = LlamaRMSNorm(hidden_size=H, eps=self.eps).to(
-                self.device
-            )
-        compiled = torch.compile(self.llama_rms_op, mode="max-autotune-no-cudagraphs")
+    def torch_compile_rms(self, H, input, weight) -> Callable:
+        module = LlamaRMSNorm(hidden_size=H, eps=self.eps).to(self.device)
+        module.weight = weight
+        self.llama_rms_op = module
+        compiled = torch.compile(module, mode="max-autotune-no-cudagraphs")
         return lambda: compiled(input)
 
+    @register_benchmark()
+    def triton_fused_rmsnorm(self, H, input, weight) -> Callable:
+        return lambda: fused_triton.rms_norm(input, H, weight, self.eps)
+
     @register_benchmark(enabled=is_hip() and HAS_AITER)
-    def aiter(self, H, input) -> Callable:
-        self.aiter_rms_op = AITerRMSNorm(hidden_size=H, eps=self.eps).to(self.device)
-        return lambda: self.aiter_rms_op(input)
+    def aiter(self, H, input, weight) -> Callable:
+        module = AITerRMSNorm(hidden_size=H, eps=self.eps).to(self.device)
+        module.weight = weight
+        self.aiter_rms_op = module
+        return lambda: module(input)
+
+    @register_benchmark(enabled=HAS_TILELANG)
+    def tilelang(self, H, input, weight) -> Callable:
+        module = TileLangRMSNorm(hidden_size=H, eps=self.eps).to(self.device)
+        module.weight = weight
+        return module(input)
 
     @register_x_val(label="(M, H)")
     def get_x_val(self, example_inputs) -> Tuple[int, int]:
         H = example_inputs[0]
         return (self.M, H)
-
-    def get_bwd_fn(self, fwd_fn: Callable) -> Callable:
-        y = fwd_fn()
-        do = torch.randn_like(y)
-        return lambda: y.backward(do, retain_graph=True)

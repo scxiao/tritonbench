@@ -1,3 +1,4 @@
+import logging
 from itertools import accumulate
 from typing import Any, Generator, List, Tuple
 
@@ -12,16 +13,19 @@ from tritonbench.utils.triton_op import (
     register_metric,
 )
 
+logger = logging.getLogger(__name__)
+
 # Try to import Cutlass and CuteDSL
 try:
     import cutlass
     import cutlass.utils as utils
 
-    from .cutedsl import compile_cutedsl_grouped_gemm
+    from .cutedsl.kernels import compile_cutedsl_grouped_gemm, grouped_gemm_sm100_tuned
 
     # Set HAS_CUTEDSL to True if import succeeds
     HAS_CUTEDSL = True
-except (ImportError, AttributeError):
+except (ImportError, AttributeError) as e:
+    logger.warning(f"Failed to import CuteDSL and/or Cutlass: {e}")
     HAS_CUTEDSL = False
 
 
@@ -30,15 +34,44 @@ from .kernels import triton_group_gemm_fn
 IS_B200 = is_cuda() and get_nvidia_gpu_model() == "NVIDIA B200"
 
 
+def get_default_shapes():
+    group_size = 4
+    x_vals = [2**i for i in range(7, 11)]  # 128, 256, 512, 1024
+
+    shapes = []
+    for N in x_vals:
+        M = K = N
+        N_out = N
+        A_shapes = [(M, K)] * group_size
+        B_shape = (K, N_out)
+        shapes.append((A_shapes, B_shape))
+
+    return shapes
+
+
 # TODO(nikhilap): Add a separate 3D grouped_gemm operator to alleviate the restriction that all B tensors must be the same.
 class Operator(BenchmarkOperator):
     DEFAULT_PRECISION = "bf16"
     DEFAULT_METRICS = ["latency", "speedup", "accuracy"]
+    FWD_ONLY = True
 
     @register_benchmark(baseline=True)
     def aten_grouped_mm(self, group_A, group_B):
+        def _inner():
+            A_packed, B_shared, offs = self.list_input_to_jagged(group_A, group_B)
+            return torch._grouped_mm(A_packed, B_shared, offs=offs, bias=None)
+
+        return _inner
+
+    # Version of the ATen benchmark that doesn't time input preprocessing
+    @register_benchmark()
+    def preprocessed_aten_grouped_mm(self, group_A, group_B):
         A_packed, B_shared, offs = self.list_input_to_jagged(group_A, group_B)
-        return lambda: torch._grouped_mm(A_packed, B_shared, offs=offs, bias=None)
+
+        def _inner():
+            return torch._grouped_mm(A_packed, B_shared, offs=offs, bias=None)
+
+        return _inner
 
     @register_benchmark()
     def naive(self, group_A, group_B):
@@ -55,8 +88,27 @@ class Operator(BenchmarkOperator):
 
         return _inner
 
-    @register_benchmark()
-    def pt2_triton_grouped_mm(self, group_A, group_B):
+    # TODO: Does not work on hip
+    @register_benchmark(enabled=is_cuda())
+    def torch_compile_grouped_gemm(self, group_A, group_B):
+        def _inner():
+            torch._dynamo.reset()
+
+            with inductor_config.patch(
+                max_autotune=True,
+                max_autotune_gemm_backends="TRITON",
+                autotune_fallback_to_aten=False,
+            ):
+                A_packed, B_shared, offs = self.list_input_to_jagged(group_A, group_B)
+                compiled = torch.compile(torch._grouped_mm, dynamic=False)
+                return compiled(A_packed, B_shared, offs=offs, bias=None)
+
+        return _inner
+
+    # Version of the Inductor Triton benchmark that doesn't time input preprocessing
+    # TODO: Does not work on hip
+    @register_benchmark(enabled=is_cuda())
+    def preprocessed_pt2_triton_grouped_mm(self, group_A, group_B):
         torch._dynamo.reset()
 
         with inductor_config.patch(
@@ -66,15 +118,35 @@ class Operator(BenchmarkOperator):
         ):
             A_packed, B_shared, offs = self.list_input_to_jagged(group_A, group_B)
             compiled = torch.compile(torch._grouped_mm, dynamic=False)
-            return lambda: compiled(A_packed, B_shared, offs=offs, bias=None)
-
-    @register_benchmark()
-    def triton(self, group_A, group_B):
-        (d_a_ptrs, d_b_ptrs, d_c_ptrs, d_g_sizes, d_g_lds, group_C) = (
-            self.list_input_to_triton_input(group_A, group_B)
-        )
 
         def _inner():
+            return compiled(A_packed, B_shared, offs=offs, bias=None)
+
+        return _inner
+
+    @register_benchmark(enabled=False)
+    def preprocessed_pt2_cute_grouped_mm(self, group_A, group_B):
+        torch._dynamo.reset()
+
+        A_packed, B_shared, offs = self.list_input_to_jagged(group_A, group_B)
+        compiled = torch.compile(torch._grouped_mm, dynamic=False)
+
+        def _inner():
+            with inductor_config.patch(
+                max_autotune=True,
+                max_autotune_gemm_backends="CUTEDSL",
+                autotune_fallback_to_aten=False,
+            ):
+                return compiled(A_packed, B_shared, offs=offs, bias=None)
+
+        return _inner
+
+    @register_benchmark()
+    def triton_grouped_gemm(self, group_A, group_B):
+        def _inner():
+            (d_a_ptrs, d_b_ptrs, d_c_ptrs, d_g_sizes, d_g_lds, group_C) = (
+                self.list_input_to_triton_input(group_A, group_B)
+            )
             outs = triton_group_gemm_fn(
                 d_a_ptrs,
                 d_b_ptrs,
@@ -89,8 +161,13 @@ class Operator(BenchmarkOperator):
 
         return _inner
 
+    # NOTE(nikhilap): These CuteDSL kernels are highly experimental, and certain design decisions may affect the accuracy of their measurements.
+    # In the kernel below, it was decided to NOT include the time it takes to convert from Torch to Cute tensors and construct the tensors of
+    # dims, strides, etc. that the kernel needs. Additionally, we are not including the compile time. This was done so we can measure raw kernel
+    # performance. The Inductor implementation has not yet been fleshed out, but should hopefully hide some of the preprocessing steps we have chosen
+    # to omit here.
     @register_benchmark(enabled=HAS_CUTEDSL and IS_B200)
-    def cutedsl_grouped_mm(self, group_A, group_B):
+    def precompiled_cutedsl_grouped_mm(self, group_A, group_B):
         (
             compiled_grouped_gemm,
             initial_cute_tensors_abc,
@@ -140,29 +217,135 @@ class Operator(BenchmarkOperator):
 
         return _inner
 
-    def get_input_iter(self) -> Generator:
-        # NOTE:
-        # The 2D+offs variant of torch._grouped_mm only supports a *single shared B* across groups.
-        # That’s why group_B here just repeats the same B_shared reference.
-        # If you need truly different B_i per group, you cannot use the 2D+offs API —
-        # instead, you must switch to the 3D variant (both A and B 3D) where offs is not required.
-        self.group_size = 4
-        x_vals = [2**i for i in range(7, 11)]  # 128, 256, 512, 1024
+    @register_benchmark(enabled=HAS_CUTEDSL and IS_B200)
+    def cutedsl_grouped_mm(self, group_A, group_B):
+        def _inner():
+            (
+                compiled_grouped_gemm,
+                initial_cute_tensors_abc,
+                tensor_of_dim_size_mnkl,
+                tensor_of_strides_abc,
+                tensor_of_ptrs_abc,
+                tensor_of_tensormap,
+                current_stream,
+                torch_tensors_abc,
+            ) = compile_cutedsl_grouped_gemm(
+                group_A,
+                group_B,
+                ab_dtype=cutlass.Float16
+                if self.dtype == torch.float16
+                else cutlass.BFloat16,
+                c_dtype=cutlass.Float16
+                if self.dtype == torch.float16
+                else cutlass.BFloat16,
+                acc_dtype=cutlass.Float32,
+                a_major="m",
+                b_major="n",
+                c_major="m",
+                mma_tiler_mn=(128, 128),
+                cluster_shape_mn=(1, 1),
+                use_2cta_instrs=False,
+                tensormap_update_mode=utils.TensorMapUpdateMode.SMEM,
+                tolerance=0.5,
+                warmup_iterations=0,
+                iterations=1,
+                skip_ref_check=True,
+            )
 
-        for N in x_vals:
-            G = self.group_size
-            M = K = N
-            N_out = N
+            compiled_grouped_gemm(
+                initial_cute_tensors_abc[0],
+                initial_cute_tensors_abc[1],
+                initial_cute_tensors_abc[2],
+                tensor_of_dim_size_mnkl,
+                tensor_of_strides_abc,
+                tensor_of_ptrs_abc,
+                tensor_of_tensormap,
+                current_stream,
+            )
+
+            outs = [C.squeeze(-1) for (_, _, C) in torch_tensors_abc]
+            return torch.cat(outs, dim=0)
+
+        return _inner
+
+    # Autotunes the CuteDSL kernel then returns the version compiled with the best configs. Similar to the Triton benchmarks,
+    # autotuning time is not included in benchmark measurements.
+    # NOTE(nikhilap): Right now we use the shape as an autotune key much like Triton. It is unclear whether that is the right approach for CuteDSL,
+    # given how Quack keys instead on dynamic scheduling.
+    @register_benchmark(enabled=HAS_CUTEDSL and IS_B200)
+    def precompiled_cutedsl_grouped_mm_tuned(self, group_A, group_B):
+        # --- Trigger autotune outside of timing ---
+        shape_sig = tuple(
+            (A.shape[0], B.shape[1], A.shape[1]) for A, B in zip(group_A, group_B)
+        )
+        grouped_gemm_sm100_tuned(
+            group_A,
+            group_B,
+            ab_dtype=cutlass.Float16
+            if self.dtype == torch.float16
+            else cutlass.BFloat16,
+            c_dtype=cutlass.Float16
+            if self.dtype == torch.float16
+            else cutlass.BFloat16,
+            acc_dtype=cutlass.Float32,
+            a_major="m",
+            b_major="n",
+            c_major="m",
+            skip_ref_check=True,
+            shape_sig=shape_sig,
+        )
+        torch.cuda.synchronize()
+
+        # --- Return timed closure ---
+        def _inner():
+            outs = grouped_gemm_sm100_tuned(
+                group_A,
+                group_B,
+                ab_dtype=cutlass.Float16
+                if self.dtype == torch.float16
+                else cutlass.BFloat16,
+                c_dtype=cutlass.Float16
+                if self.dtype == torch.float16
+                else cutlass.BFloat16,
+                acc_dtype=cutlass.Float32,
+                skip_ref_check=True,
+                shape_sig=shape_sig,
+            )
+            outs = [C.squeeze(-1) for (_, _, C) in outs]
+            return torch.cat(outs, dim=0)
+
+        return _inner
+
+    def get_input_iter(self) -> Generator:
+        """
+        If external shapes are provided, generate inputs for those shapes.
+        If not, fall back to the default sweep:
+            group_size = 4
+            x_vals = [128, 256, 512, 1024]
+        NOTE:
+        The 2D+offs variant of torch._grouped_mm only supports a *single shared B* across groups.
+        That’s why group_B here just repeats the same B_shared reference.
+        If you need truly different B_i per group, you cannot use the 2D+offs API —
+        instead, you must switch to the 3D variant (both A and B 3D) where offs is not required.
+        """
+        if hasattr(self, "external_shapes") and self.external_shapes:
+            self.shapes = self.external_shapes
+        else:
+            self.shapes = get_default_shapes()
+
+        # Generate tensors from shapes
+        for A_shapes, B_shape in self.shapes:
+            G = len(A_shapes)
 
             B_shared = torch.rand(
-                (K, N_out), device=self.device, dtype=self.dtype
+                B_shape, device=self.device, dtype=self.dtype
             ).contiguous()
 
             group_A = [
-                torch.rand((M, K), device=self.device, dtype=self.dtype).contiguous()
-                for _ in range(G)
+                torch.rand(A_shape, device=self.device, dtype=self.dtype).contiguous()
+                for A_shape in A_shapes
             ]
-            group_B = [B_shared] * G  # same weight per group in list-form
+            group_B = [B_shared] * G
 
             yield (group_A, group_B)
 

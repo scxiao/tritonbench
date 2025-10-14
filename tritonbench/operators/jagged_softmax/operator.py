@@ -75,6 +75,7 @@ def parse_op_args(args: List[str]):
 class Operator(BenchmarkOperator):
     DEFAULT_METRICS = ["latency", "accuracy", "best_config"]
     DEFAULT_PRECISION = "fp32"
+    FWD_ONLY = True
 
     def __init__(
         self, tb_args: argparse.Namespace, extra_args: Optional[List[str]] = None
@@ -128,6 +129,15 @@ class Operator(BenchmarkOperator):
             )
 
         return _inner
+
+    @register_benchmark()
+    def torch_compile_jagged_softmax_torch_sum(
+        self, x: torch.Tensor, B: int, M: int, seqlen: int, sparsity: float
+    ):
+        return torch.compile(
+            self.torch_jagged_softmax_torch_sum(x, B, M, seqlen, sparsity),
+            mode="max-autotune-no-cudagraphs",
+        )
 
     @register_benchmark()
     def triton_jagged_softmax_simple_fused(

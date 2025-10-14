@@ -1,6 +1,10 @@
 name: TritonBench PR Test
 on:
   pull_request:
+    paths:
+      - .github/workflows/pr.yml
+      - .github/workflows/_linux-test-*.yml
+      - tritonbench/**
   push:
     branches:
       - main
@@ -14,6 +18,12 @@ jobs:
     uses: ./.github/workflows/_linux-test-h100.yml
     with:
       conda_env: "triton-main"
+  mi350-triton-main-test:
+    uses: ./.github/workflows/_linux-test-mi350.yml
+    with:
+      conda_env: "triton-main"
+
+
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}-${{ github.event_name == 'workflow_dispatch' }}

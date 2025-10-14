@@ -10,6 +10,8 @@ from pathlib import Path
 
 from typing import Dict, List, Optional
 
+import torch
+
 import yaml
 
 from tritonbench.utils.env_utils import is_fbcode
@@ -44,8 +46,6 @@ def get_run_env(
     Gather environment of the benchmark.
     repo_locs: Git repository dict of the repositories.
     """
-    import torch
-
     run_env = {}
     run_env["benchmark_date"] = run_timestamp
     run_env["cuda_version"] = torch.version.cuda if torch.version.cuda else "unknown"
@@ -57,9 +57,9 @@ def get_run_env(
     run_env["pytorch_commit"] = torch.version.git_version
     # we assume Tritonbench CI will properly set Triton commit hash in env
     run_env["triton_commit"] = os.environ.get(
-        "TRITONBENCH_TRITON_MAIN_COMMIT", "unknown"
+        "TRITONBENCH_TRITON_COMMIT_HASH", get_current_hash(repo_locs["triton"])
     )
-    run_env["tritonbench_commit"] = get_current_hash(REPO_PATH)
+    run_env["tritonbench_commit"] = get_current_hash(repo_locs["tritonbench"])
     for repo in ["triton", "pytorch", "tritonbench"]:
         repo_loc = repo_locs.get(repo, None)
         if not run_env[f"{repo}_commit"] == "unknown" and repo_loc:
@@ -73,40 +73,19 @@ def get_run_env(
     return run_env
 
 
-def get_github_env() -> Dict[str, str]:
-    assert (
-        "GITHUB_RUN_ID" in os.environ
-    ), "GITHUB_RUN_ID environ must exist to obtain GitHub env"
-    out = {}
-    out["GITHUB_ACTION"] = os.environ["GITHUB_ACTION"]
-    out["GITHUB_ACTOR"] = os.environ["GITHUB_ACTOR"]
-    out["GITHUB_BASE_REF"] = os.environ["GITHUB_BASE_REF"]
-    out["GITHUB_REF"] = os.environ["GITHUB_REF"]
-    out["GITHUB_REF_PROTECTED"] = os.environ["GITHUB_REF_PROTECTED"]
-    out["GITHUB_REPOSITORY"] = os.environ["GITHUB_REPOSITORY"]
-    out["GITHUB_RUN_ATTEMPT"] = os.environ["GITHUB_RUN_ATTEMPT"]
-    out["GITHUB_RUN_ID"] = os.environ["GITHUB_RUN_ID"]
-    out["GITHUB_RUN_NUMBER"] = os.environ["GITHUB_RUN_NUMBER"]
-    out["GITHUB_WORKFLOW"] = os.environ["GITHUB_WORKFLOW"]
-    out["GITHUB_WORKFLOW_REF"] = os.environ["GITHUB_WORKFLOW_REF"]
-    out["GITHUB_WORKFLOW_SHA"] = os.environ["GITHUB_WORKFLOW_SHA"]
-    out["JOB_NAME"] = os.environ["JOB_NAME"]
-    out["RUNNER_ARCH"] = os.environ["RUNNER_ARCH"]
-    out["RUNNER_TYPE"] = os.environ["RUNNER_TYPE"]
-    out["RUNNER_NAME"] = os.environ["RUNNER_NAME"]
-    out["RUNNER_OS"] = os.environ["RUNNER_OS"]
-    return out
-
-
-def run_config(config_file: str):
+def run_config(config_file: str, args: List[str]):
     assert Path(config_file).exists(), f"Config file {config_file} must exist."
     with open(config_file, "r") as fp:
         config = yaml.safe_load(fp)
     for benchmark_name in config:
         benchmark_config = config[benchmark_name]
         op_name = benchmark_config["op"]
-        op_args = benchmark_config["args"].split(" ")
+        op_args = benchmark_config["args"].split(" ") + args
         env_string = benchmark_config.get("envs", None)
+        disabled = benchmark_config.get("disabled", False)
+        if disabled:
+            logger.info(f"Skipping disabled benchmark {benchmark_name}.")
+            continue
         extra_envs = {}
         if env_string:
             for env_part in env_string.split(" "):

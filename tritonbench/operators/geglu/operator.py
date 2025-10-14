@@ -42,6 +42,18 @@ class Operator(BenchmarkOperator):
             LigerGEGLUMLP(self.llama_config).to(self.device).to(self.dtype)
         )
 
+        # Copy weights from baseline to liger model for fair accuracy comparison
+        with torch.no_grad():
+            self.liger_model.gate_proj.weight.data.copy_(
+                self.baseline_model.gate_proj.weight.data
+            )
+            self.liger_model.up_proj.weight.data.copy_(
+                self.baseline_model.up_proj.weight.data
+            )
+            self.liger_model.down_proj.weight.data.copy_(
+                self.baseline_model.down_proj.weight.data
+            )
+
     def get_input_iter(self) -> Generator:
         for T in [2**i for i in range(10, 14)]:
             x_shape = (self.bsz, T, self.hidden_size)
@@ -78,8 +90,3 @@ class Operator(BenchmarkOperator):
             example_inputs[0].size(1),
             example_inputs[0].size(2),
         )
-
-    def get_bwd_fn(self, fwd_fn: Callable) -> Callable:
-        y = fwd_fn()
-        do = torch.randn_like(y)
-        return lambda: y.backward(do, retain_graph=True)

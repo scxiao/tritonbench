@@ -46,7 +46,7 @@ def get_parser(args=None):
         "--device",
         "-d",
         default="cuda",
-        choices=["cuda", "cpu"],
+        choices=["cuda", "cpu", "mtia"],
         help="Device to benchmark.",
     )
     parser.add_argument(
@@ -137,6 +137,12 @@ def get_parser(args=None):
         help="Specify one or multiple kernel implementations to skip.",
     )
     parser.add_argument(
+        "--force",
+        action="store_true",
+        default=False,
+        help="Force all --only benchmarks to run, despite possibly not being enabled.",
+    )
+    parser.add_argument(
         "--only-match-mode",
         default="exact",
         choices=["exact", "prefix-with-baseline"],
@@ -155,13 +161,28 @@ def get_parser(args=None):
         action="store_true",
     )
     parser.add_argument(
+        "--exit-on-exception",
+        action="store_true",
+        default=False,
+        help="Immediately terminate the process if any operator run raises an exception.",
+    )
+    parser.add_argument(
         "--input-id",
-        type=int,
-        default=0,
-        help="Specify the start input id to run. "
-        "For example, --input-id 0 runs only the first available input sample."
-        "When used together like --input-id <X> --num-inputs <Y>, start from the input id <X> "
-        "and run <Y> different inputs.",
+        type=str,
+        default="0",
+        help="Specify the input id(s) to run. Can be a single integer or comma-separated list of integers. "
+        "For example, --input-id 0 runs only the first available input sample. "
+        "--input-id 0,2,4 runs inputs at indices 0, 2, and 4. "
+        "When used together like --input-id <X> --num-inputs <Y> with a single ID, start from the input id <X> "
+        "and run <Y> different inputs. When multiple IDs are specified, --num-inputs is not supported.",
+    )
+    parser.add_argument(
+        "--input-sample-mode",
+        type=str,
+        default="first-k",
+        choices=["first-k", "equally-spaced-k"],
+        help="Input sampling mode. 'first-k' (default) uses the first k inputs starting from --input-id. "
+        "'equally-spaced-k' selects k equally spaced inputs from the entire input range, where k is specified by --num-inputs.",
     )
     parser.add_argument(
         "--test-only",
@@ -173,6 +194,12 @@ def get_parser(args=None):
         type=str,
         default=None,
         help="Dump Triton IR to specific directory.",
+    )
+    parser.add_argument(
+        "--power-chart",
+        type=str,
+        default=None,
+        help="Dump GPU power chart to specific directory.",
     )
     parser.add_argument(
         "--gpu-lockdown",
@@ -216,7 +243,7 @@ def get_parser(args=None):
     parser.add_argument(
         "--export",
         default=None,
-        choices=["in", "out", "both"],
+        choices=["input", "output", "both"],
         help="Export input or output. Must be used together with --export-dir.",
     )
     parser.add_argument(
@@ -288,9 +315,9 @@ def get_parser(args=None):
         help="Configuration B for A/B testing. Specify operator-specific arguments as a string. "
         "Example: '--side-b \"--dynamic\"'",
     )
+    parser.add_argument("--log-scuba", action="store_true", help="Log to scuba.")
 
     if is_fbcode():
-        parser.add_argument("--log-scuba", action="store_true", help="Log to scuba.")
         parser.add_argument(
             "--production-shapes",
             action="store_true",

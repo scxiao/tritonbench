@@ -7,6 +7,9 @@ import torch
 import torch._inductor.config as inductor_config
 import triton
 
+from tritonbench.operators.fp8_gemm.persistent import blackwell_persistent_tma
+from tritonbench.utils.env_utils import get_nvidia_gpu_model, is_cuda
+
 from tritonbench.utils.triton_op import (
     BenchmarkOperator,
     BenchmarkOperatorMetrics,
@@ -15,7 +18,13 @@ from tritonbench.utils.triton_op import (
     register_metric,
 )
 
+from tritonbench.utils.triton_utils import has_experimental_descriptor
+
 from .tutorial import matmul as tutorial_matmul
+
+IS_B200 = is_cuda() and get_nvidia_gpu_model() == "NVIDIA B200"
+
+torch._dynamo.config.recompile_limit = 10000
 
 logger = logging.getLogger(__name__)
 try:
@@ -49,6 +58,7 @@ def parse_args(args):
 class Operator(BenchmarkOperator):
     DEFAULT_METRICS = ["tflops", "gbps", "latency"]
     DEFAULT_PRECISION = "fp8"
+    FWD_ONLY = True
 
     def __init__(
         self, tb_args: argparse.Namespace, extra_args: Optional[List[str]] = None
@@ -91,16 +101,11 @@ class Operator(BenchmarkOperator):
 
         def args(m, n, k):
             a = torch.randn(m, k, device=self.device).to(self._get_dtype())
-            b = (
-                torch.randn(k, n, device=self.device)
-                .to(self._get_dtype())
-                .T.contiguous()
-                .T
-            )
+            b = torch.randn(n, k, device=self.device).to(self._get_dtype())
 
             if self.extra_args.scaling_rowwise:
                 scale_a = _get_scale_per_row(a)
-                scale_b = _get_scale_per_row(b, transpose=True)
+                scale_b = _get_scale_per_row(b)
             else:
                 scale_a = _get_scale_per_tensor(
                     a, custom_scale=self.extra_args.per_tensor_scale_a
@@ -148,7 +153,12 @@ class Operator(BenchmarkOperator):
     @register_benchmark(baseline=True)
     def torch_fp8_gemm(self, a, b, scale_a, scale_b):
         return lambda: torch._scaled_mm(
-            a, b, scale_a, scale_b, use_fast_accum=True, out_dtype=self._get_dtype()
+            a,
+            b.t(),
+            scale_a,
+            scale_b.t(),
+            use_fast_accum=True,
+            out_dtype=self._get_dtype(),
         )
 
     @register_benchmark()
@@ -160,26 +170,65 @@ class Operator(BenchmarkOperator):
             autotune_fallback_to_aten=False,
         ):
             f = lambda a, b: torch._scaled_mm(
-                a, b, scale_a, scale_b, use_fast_accum=True, out_dtype=self._get_dtype()
+                a,
+                b.t(),
+                scale_a,
+                scale_b.t(),
+                use_fast_accum=True,
+                out_dtype=self._get_dtype(),
             )
             compiled = torch.compile(f, dynamic=False)
             compiled(a, b)
 
         return lambda: compiled(a, b)
 
+    if IS_B200:
+
+        @register_benchmark(enabled=True)
+        def blackwell_persistent_tma_fp8_gemm(self, a, b, scale_a, scale_b):
+            return lambda: blackwell_persistent_tma(
+                a,
+                b,
+                scale_a,
+                scale_b,
+                self._get_dtype(),
+                self.extra_args.scaling_rowwise,
+            )
+
+        @register_benchmark(enabled=True)
+        def blackwell_pt2_fp8_gemm(self, a, b, scale_a, scale_b):
+            torch._dynamo.reset()
+            with inductor_config.patch(
+                max_autotune=True,
+                max_autotune_gemm_backends="TRITON",
+                autotune_fallback_to_aten=False,
+            ):
+                f = lambda a, b: torch._scaled_mm(
+                    a,
+                    b.t(),
+                    scale_a,
+                    scale_b.t(),
+                    use_fast_accum=True,
+                    out_dtype=self._get_dtype(),
+                )
+                compiled = torch.compile(f, dynamic=False)
+                compiled(a, b)
+
+            return lambda: compiled(a, b)
+
     @register_benchmark()
     def triton_fp8_gemm(self, a, b, scale_a, scale_b):
-        return lambda: tutorial_matmul(a, b)
+        return lambda: tutorial_matmul(a, b.t())
 
     @register_benchmark(enabled=HAS_TMA)
     def triton_persistent_fp8_gemm(self, a, b, scale_a, scale_b):
-        return lambda: matmul_persistent(a, b)
+        return lambda: matmul_persistent(a, b.t())
 
-    @register_benchmark(enabled=HAS_TMA)
+    @register_benchmark(enabled=HAS_TMA and has_experimental_descriptor())
     def triton_tma_persistent_fp8_gemm(self, a, b, scale_a, scale_b):
         b = b.T.contiguous()
-        c, desc_a, desc_b, desc_c = allocate_matmul_tma(a, b)
-        return lambda: matmul_tma_persistent(a, b, c, desc_a, desc_b, desc_c)
+        c, desc_a, desc_b, desc_c = allocate_matmul_tma(a, b.t())
+        return lambda: matmul_tma_persistent(a, b.t(), c, desc_a, desc_b, desc_c)
 
     @register_metric()
     def gbps(self, fn, example_inputs: Any, metrics: BenchmarkOperatorMetrics) -> float:

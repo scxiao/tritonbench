@@ -17,6 +17,8 @@ from tritonbench.utils.triton_op import (
     register_x_val,
 )
 
+from .aoti_fp8_triton_mm import aoti_fp8_triton_mm
+
 
 def parse_args(args: List[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -67,9 +69,10 @@ HAS_TRITON = False
 HAS_CUTLASS_OR_CK = False
 HAS_CUBLAS = False
 
+from tritonbench.utils.fp8_utils import get_fp8_constants
+
 try:
     from fbgemm_gpu.experimental.gemm.triton_gemm.fp8_gemm import (
-        get_fp8_constants as get_fp8_constants,
         matmul_fp8_row as triton_fp8_row,
     )
 
@@ -196,6 +199,18 @@ class Operator(BenchmarkOperator):
             tma_persistent=self.use_tma,
             no_use_persistent=self.no_use_persistent,
             use_warp_specialization=self.warp_specialization,
+        )
+
+    # disabled by default due to shape incompatibility with the other kernels
+    @register_benchmark(enabled=False)
+    def _aoti_fp8_triton_mm(self, xq, wq, x_scale, w_scale, bias) -> Callable:
+        return lambda: aoti_fp8_triton_mm(
+            xq,
+            x_scale,
+            wq,
+            w_scale,
+            bias=bias,
+            fp8_fast_accum=self.fp8_fast_accum,
         )
 
     @register_benchmark(

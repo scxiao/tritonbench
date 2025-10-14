@@ -21,6 +21,8 @@ from .triton_gather_gemv import triton_gemv_0 as triton_test_0
 
 
 class Operator(BenchmarkOperator):
+    FWD_ONLY = True
+
     @register_metric()
     def gbps(self, fn, example_inputs, metrics: BenchmarkOperatorMetrics):
         arg0_1, arg1_1, arg2_1 = example_inputs
@@ -38,17 +40,31 @@ class Operator(BenchmarkOperator):
     ):
         super().__init__(tb_args, extra_args)
 
-    @register_benchmark(baseline=True)
-    def test_0(self, p1, p2, p3) -> Callable:
+    @register_benchmark()
+    def triton_gather_gemv(self, p1, p2, p3) -> Callable:
         return lambda: triton_test_0(p1, p2, p3)
 
     @register_benchmark(baseline=True)
-    def test_eager(self, w, idx, x):
-        return lambda: w[idx].to(x.dtype) @ x
+    def eager_gather_gemv(self, w, idx, x):
+        s = x.size(0)
+
+        if s <= 8192:
+            return lambda: w[idx].to(x.dtype) @ x
+
+        # For very large matrices (e.g. S=16384) the batched advanced indexing
+        # path above launches a CUDA kernel with an invalid configuration.
+        # Fall back to per-expert slicing which is slower but robust.
+        def eager_impl():
+            outputs = []
+            for idx_val in idx.tolist():
+                outputs.append(w[idx_val].to(x.dtype) @ x)
+            return torch.stack(outputs, dim=0)
+
+        return eager_impl
 
     @register_benchmark()
-    def test_inductor(self, w, idx, x):
-        @torch.compile
+    def torch_compile_gather_gemv(self, w, idx, x):
+        @torch.compile(mode="max-autotune-no-cudagraphs")
         def gather_gemv(w, idx, x):
             return w[idx].to(x.dtype) @ x
 

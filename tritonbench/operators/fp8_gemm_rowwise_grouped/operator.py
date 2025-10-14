@@ -157,14 +157,7 @@ HAS_CUBLAS = False  # TODO: add cublas kernel
 HAS_TRITON = False
 HAS_CUTLASS_OR_CK = False
 
-# Try to import Triton GEMM module
-try:
-    from fbgemm_gpu.experimental.gemm.triton_gemm.fp8_gemm import (
-        get_fp8_constants as get_fp8_constants,
-    )
-except (ImportError, AssertionError):
-    # If import fails, set HAS_TRITON to False
-    HAS_TRITON = False
+from tritonbench.utils.fp8_utils import get_fp8_constants
 
 # Try to import Triton grouped GEMM module
 try:
@@ -340,6 +333,7 @@ class Operator(BenchmarkOperator):
 
     DEFAULT_METRICS = ["tflops", "gbps", "speedup", "accuracy"]
     DEFAULT_PRECISION = "fp8"
+    FWD_ONLY = True
 
     def __init__(
         self,
@@ -361,8 +355,8 @@ class Operator(BenchmarkOperator):
         # Call the parent class's __init__ method to initialize the base attributes
         super().__init__(tb_args, extra_args)
 
-        # Enable CUDA graphs for this operator
-        self.use_cuda_graphs = True
+        # With `--latency-measure-mode profiler`, we no longer need CUDA graphs for accurate latency measurement.
+        # self.use_cuda_graphs = True
 
         # Enable fp8_fast_accum by default. The cutlass kernel does not support configuring
         # this parameter as of now. By default it is true, but there will be correctness issues
@@ -426,7 +420,6 @@ class Operator(BenchmarkOperator):
     @register_benchmark(
         enabled=HAS_CUTLASS_OR_CK,
         label="ck" if torch.version.hip else "cutlass",
-        baseline=True,
     )
     def _cutlass_or_ck(self, group_A, group_B, m_sizes, a_scale, b_scale) -> Callable:
         """
@@ -583,7 +576,7 @@ class Operator(BenchmarkOperator):
                 # Yield the quantized tensors and their corresponding scales
                 yield group_A, group_B, m_sizes, a_scale, b_scale
 
-    def _get_accuracy(self, fn: Callable, baseline_fn: Callable) -> bool:
+    def accuracy(self, fn: Callable, baseline_fn: Callable) -> bool:
         """
         Check if the output of a function matches the output of a baseline function.
         Args:
@@ -653,38 +646,33 @@ class Operator(BenchmarkOperator):
         # Run the plot and save it to the specified path
         _plot.run(show_plots=True, print_data=True, save_path=save_path)
 
-    """
-    # # TODO: Fix this, RuntimeError: CUDA error: operation not permitted when stream is capturing
     @register_benchmark(baseline=True)
-    def _torch(self, group_A, group_B, m_sizes, a_scale, b_scale) -> Callable:
+    def eager_fp8_gemm_rowwise_grouped(
+        self, group_A, group_B, m_sizes, a_scale, b_scale
+    ) -> Callable:
         def torch_perf_fn(group_A, group_B, m_sizes, a_scale, b_scale):
             group_size = len(m_sizes)
             xq, wq = group_A, group_B
             m, k = xq.size()
-            gn, k = wq.size()
+            gn, _ = wq.size()
             n = gn // group_size
 
             expected_result = torch.zeros(
                 m, n, dtype=torch.bfloat16, device=self.device
             )
-            m_offsets, _ = torch.sort(
-                torch.randint(
-                    low=0,
-                    high=m,
-                    size=[group_size],
-                    device=self.device,
-                    dtype=torch.int32,
-                )
-            )
-            m_offsets[group_size - 1] = m
 
-            # Running baseline with quantization to exclude quantization error from the test as it has nothing to do with the correctness of the kernel implementation.
+            # m_sizes holds the row count for each group; cumulative offsets mark
+            # the starting row for every group in the flattened input tensor.
+            m_starts = cumulative_sum_with_initial_offset(m_sizes)
+
             for g in range(group_size):
-                m_start = 0 if g == 0 else m_offsets[g - 1]
-                m_end = m_offsets[g]
+                m_start = int(m_starts[g].item())
+                m_end = m_start + int(m_sizes[g].item())
                 n_start = g * n
-                n_end = (g + 1) * n
+                n_end = n_start + n
 
+                # Dequantize the FP8 tiles with their row-wise scales before performing
+                # the per-group matmul against the matching weight slice.
                 expected_result[m_start:m_end, :] = (
                     group_A[m_start:m_end, :].to(torch.float32)
                     @ group_B[n_start:n_end, :].to(torch.float32).T
@@ -692,11 +680,6 @@ class Operator(BenchmarkOperator):
                     * b_scale[n_start:n_end][None, :]
                 ).to(torch.bfloat16)
 
-            # for a, b in zip(group_A, group_B):
-            #     a_fp16 = a.to(torch.float16)
-            #     b_fp16 = b.to(torch.float16)
-            #     out.append(torch.matmul(a_fp16, b_fp16))
             return expected_result
 
         return lambda: torch_perf_fn(group_A, group_B, m_sizes, a_scale, b_scale)
-"""
