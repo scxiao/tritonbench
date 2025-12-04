@@ -4,6 +4,16 @@ import torch
 import triton
 import triton.language as tl
 
+IS_HIP = (
+    torch.version.hip is not None
+    and torch.cuda.is_available()
+)
+
+IS_CUDA = (
+    torch.version.cuda is not None
+    and torch.cuda.is_available()
+)
+
 
 @triton.jit
 def _layer_norm_fwd_fused_no_bias(
@@ -179,7 +189,8 @@ class LayerNorm(torch.autograd.Function):
 
         M, N = x_arg.shape
         NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
-        BLOCK_SIZE_M = min(2048, triton.next_power_of_2(M // (8 * NUM_SMS)))
+        ROWS_PER_BLOCK = 1 if IS_HIP else 8
+        BLOCK_SIZE_M = min(2048, triton.next_power_of_2(M // (ROWS_PER_BLOCK * NUM_SMS)))
         PARTIAL_SIZE = math.ceil(M / BLOCK_SIZE_M)
 
         # Columnwise stride for reducing partial sums at end, contiguous loads

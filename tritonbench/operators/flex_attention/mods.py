@@ -141,7 +141,8 @@ def _(inp: torch.Tensor) -> torch.Tensor:
 
 
 def _tanh_approx_lowering(inp):
-    fn = partial(ops.inline_asm_elementwise, asm="tanh.approx.f32 $0, $1;")
+    # fn = partial(ops.inline_asm_elementwise, asm="tanh.approx.f32 $0, $1;")
+    fn = ops.fast_tanhf
     return make_pointwise(fn)(inp)
 
 
