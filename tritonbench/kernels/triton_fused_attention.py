@@ -633,11 +633,16 @@ else:
                 num_warps=w,
             )
         )
-        for BM in [16, 32, 64, 128]
-        for BN in [16, 32, 64, 128]
-        for s in ([1, 2])
-        for w in [1, 2, 4, 8]
-        for wpe in [0, 1, 2, 3, 4]
+        for BM in [128]
+        for BN in [16]
+        for s in ([2])
+        for w in [1]
+        for wpe in [2]
+        # for BM in [16, 32, 64, 128]
+        # for BN in [16, 32, 64, 128]
+        # for s in ([1, 2])
+        # for w in [1, 2, 4, 8]
+        # for wpe in [0, 1, 2, 3, 4]
     ]
 # no WS, no TMA, with CompPipe
 configsOpt = get_fwd_config_space(False, False, HAS_EXPLICIT_WS, False)
